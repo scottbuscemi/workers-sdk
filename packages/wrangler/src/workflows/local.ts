@@ -5,6 +5,7 @@ import type {
 	InstanceStatusAndLogs,
 	WorkflowInstanceRestartFrom,
 } from "./types";
+import type { WorkflowBatchDeleteResult } from "@cloudflare/workflows-shared/src/types";
 
 const LOCAL_EXPLORER_BASE_PATH = "/cdn-cgi/explorer/api";
 const DEFAULT_LOCAL_PORT = 8787;
@@ -78,20 +79,27 @@ export async function fetchLocalResult<T>(
 		const json = (await response
 			.json()
 			.catch(() => null)) as LocalApiResponse<T | null> | null;
-		const errorMessage =
-			json?.errors?.[0]?.message ?? `HTTP ${response.status}`;
-		throw new UserError(`Local API error: ${errorMessage}`, {
-			telemetryMessage: "workflows local api error response",
-		});
+		const apiError = json?.errors?.[0];
+		throw new UserError(
+			`Local API error: ${apiError?.message ?? `HTTP ${response.status}`}`,
+			{
+				telemetryMessage: "workflows local api error response",
+				cause: apiError,
+			}
+		);
 	}
 
 	const json = (await response.json()) as LocalApiResponse<T>;
 
 	if (!json.success) {
-		const errorMessage = json.errors?.[0]?.message ?? "Unknown local API error";
-		throw new UserError(`Local API error: ${errorMessage}`, {
-			telemetryMessage: "workflows local api unsuccessful response",
-		});
+		const apiError = json.errors?.[0];
+		throw new UserError(
+			`Local API error: ${apiError?.message ?? "Unknown local API error"}`,
+			{
+				telemetryMessage: "workflows local api unsuccessful response",
+				cause: apiError,
+			}
+		);
 	}
 
 	return json.result;
@@ -161,6 +169,64 @@ export async function updateLocalInstanceStatus(
 			body: JSON.stringify(body),
 		}
 	);
+}
+
+async function deleteLocalInstance(
+	port: number,
+	workflowName: string,
+	instanceId: string
+): Promise<void> {
+	await fetchLocalResult<{ success: boolean }>(
+		port,
+		`/workflows/${encodeURIComponent(workflowName)}/instances/${encodeURIComponent(instanceId)}`,
+		{
+			method: "DELETE",
+		}
+	);
+}
+
+export async function deleteLocalInstances(
+	port: number,
+	workflowName: string,
+	instanceIds: string[]
+): Promise<WorkflowBatchDeleteResult> {
+	const uniqueIds = [...new Set(instanceIds)];
+	const deletions: Promise<void>[] = [];
+	for (const id of uniqueIds) {
+		deletions.push(deleteLocalInstance(port, workflowName, id));
+	}
+
+	const settled = await Promise.allSettled(deletions);
+	const resultsById = new Map(
+		uniqueIds.map((id, index) => [id, settled[index]])
+	);
+	const result: WorkflowBatchDeleteResult = { deleted: [], errors: [] };
+	for (const id of instanceIds) {
+		const deletion = resultsById.get(id);
+		if (deletion === undefined) {
+			throw new Error("Missing batch deletion result");
+		}
+		if (deletion.status === "fulfilled") {
+			result.deleted.push({ id });
+			continue;
+		}
+
+		const cause =
+			deletion.reason instanceof Error ? deletion.reason.cause : undefined;
+		const apiCode =
+			typeof cause === "object" && cause !== null && "code" in cause
+				? cause.code
+				: undefined;
+		const isNotFound = apiCode === 10501;
+		result.errors.push({
+			id,
+			code: isNotFound ? 10400 : 10001,
+			message: isNotFound
+				? "workflows.api.error.instance.not_found"
+				: "workflows.api.error.internal_server",
+		});
+	}
+	return result;
 }
 
 // ============================================================================
